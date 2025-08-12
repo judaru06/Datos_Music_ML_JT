@@ -8,15 +8,12 @@ BASE_DIR = Path(r"IQ_samps")
 OUT_DIR  = Path(r"COV")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-K_SELECT = 3                      # nº de tomas a conservar por ángulo
-SELECTION = "power"               # "power" | "oldest" | "newest"
+K_SELECT   = 3          # nº de tomas a conservar por ángulo
+SELECTION  = "power"    # "power" | "oldest" | "newest"
+SEGMENTS   = 50         # dividir cada archivo en 50 partes -> 3*50 = 150 muestras/ángulo
+REMOVE_MEAN = True      # quitar media por canal antes de cov (recomendado)
 
-# Segmentación: o defines N_SEGMENTS o defines L (tamaño de ventana)
-N_SEGMENTS = 50                   # nº de segmentos no solapados por toma
-L = None                          # si quieres fijar tamaño de ventana, pon un entero aquí y N_SEGMENTS=None
-REMOVE_MEAN_PER_SEG = True        # quitar media por canal en cada segmento (recomendado)
-
-# patrón de nombre: IQ_ch{ch}_{YYYYMMDD}_{HHMMSS}_{ANGLE}.npy
+# patrón: IQ_ch{ch}_{YYYYMMDD}_{HHMMSS}_{ANGLE}.npy
 pat = re.compile(r"^IQ_ch(?P<ch>\d+)_(?P<date>\d{8})_(?P<time>\d{6})_(?P<angle>[A-D]\d+)\.npy$", re.IGNORECASE)
 
 # ===== 1) Indexar archivos → shots[(angle, stamp)][ch] = Path =====
@@ -26,14 +23,12 @@ for p in BASE_DIR.glob("*.npy"):
     if not m:
         continue
     ch = int(m.group("ch"))
-    date = m.group("date")
-    time = m.group("time")
     angle = m.group("angle").upper()
-    stamp = f"{date}_{time}"
+    stamp = f"{m.group('date')}_{m.group('time')}"
     shots.setdefault((angle, stamp), {})
     shots[(angle, stamp)][ch] = p
 
-# Agrupar por ángulo (solo tomas con los 4 canales)
+# Agrupar por ángulo y filtrar tomas completas (4ch)
 per_angle = defaultdict(list)
 for (angle, stamp), chmap in shots.items():
     if len(chmap) == 4:
@@ -41,86 +36,108 @@ for (angle, stamp), chmap in shots.items():
 
 # ===== 2) Helpers =====
 def load_X(chmap: dict):
-    """Carga los 4 canales en orden ch0..ch3 → X de shape (4, N)."""
-    X = np.vstack([np.load(chmap[ch]) for ch in sorted(chmap.keys())])  # (4, T)
+    """Carga los 4 canales ch0..ch3 → X shape (4, N)."""
+    X = np.vstack([np.load(chmap[ch]) for ch in sorted(chmap.keys())])
     return X
 
 def cov_from_X(X: np.ndarray):
-    """Rxx = X X^H / N  → shape (M, M)."""
+    """Rxx = X X^H / N → shape (M, M)."""
     return (X @ X.conj().T) / X.shape[1]
 
 def power_metric(X: np.ndarray):
     """Potencia media ≈ mean(|X|^2)."""
     return float(np.mean(np.abs(X)**2))
 
-def select_shots(angle: str, items, k=3, mode="power"):
-    """Selecciona k tomas según criterio."""
+def select_shots(items, k=3, mode="power"):
+    """items = [(stamp, chmap), ...] → selecciona k tomas."""
     if mode == "oldest":
-        items = sorted(items, key=lambda t: t[0])[:k]
-    elif mode == "newest":
-        items = sorted(items, key=lambda t: t[0], reverse=True)[:k]
-    elif mode == "power":
+        return sorted(items, key=lambda t: t[0])[:k]
+    if mode == "newest":
+        return sorted(items, key=lambda t: t[0], reverse=True)[:k]
+    if mode == "power":
         scored = []
         for stamp, chmap in items:
             X = load_X(chmap)
             scored.append((power_metric(X), stamp, chmap))
-        scored.sort(reverse=True, key=lambda x: x[0])  # mayor potencia primero
-        items = [(stamp, chmap) for _, stamp, chmap in scored[:k]]
-    else:
-        raise ValueError("SELECTION inválido")
-    return items
+        scored.sort(reverse=True, key=lambda x: x[0])
+        return [(stamp, chmap) for _, stamp, chmap in scored[:k]]
+    raise ValueError("SELECTION inválido")
 
-def iter_segments(X: np.ndarray, n_segments=None, L=None):
-    """
-    Genera segmentos (submatrices) de X con tamaño (4, L).
-    Si se da n_segments: divide en ese número de partes no solapadas.
-    Si se da L: usa ventanas de largo L (no solapadas) tantas como quepan.
-    """
-    T = X.shape[1]
-    if n_segments is not None:
-        L_eff = T // n_segments
-        n_eff = n_segments
-    elif L is not None:
-        L_eff = int(L)
-        n_eff = T // L_eff
-    else:
-        raise ValueError("Debes especificar n_segments o L")
+# ===== 3) Construir dataset: dividir en 50 segmentos, cov por segmento, aplanar =====
+rows_real = []     # lista de filas reales (N_total x 16)
+rows_imag = []     # lista de filas imaginarias (N_total x 16)
+labels    = []     # ángulo como texto (e.g., "D6")
+meta      = []     # (angle, stamp, seg_idx) por si quieres rastrear
 
-    start = 0
-    for i in range(n_eff):
-        s = start + i * L_eff
-        e = s + L_eff
-        if e <= T:
-            Xi = X[:, s:e]
-            if REMOVE_MEAN_PER_SEG:
-                Xi = Xi - Xi.mean(axis=1, keepdims=True)
-            yield i, Xi
+angles_sorted = sorted(per_angle.keys(), key=lambda a: (a[0], int(a[1:])))
+angle_to_idx  = {ang:i for i, ang in enumerate(angles_sorted)}  # clase numérica
 
-# ===== 3) Pipeline principal =====
-summary = []
-for angle, items in per_angle.items():
-    if len(items) == 0:
+for angle in angles_sorted:
+    items = per_angle[angle]
+    if not items:
         continue
+    selected = select_shots(items, k=min(K_SELECT, len(items)), mode=SELECTION)
 
-    # Seleccionar K tomas por ángulo
-    selected = select_shots(angle, items, k=min(K_SELECT, len(items)), mode=SELECTION)
-
-    total_saved = 0
     for stamp, chmap in selected:
-        X = load_X(chmap)  # (4, T)
+        X = load_X(chmap)                 # (4, N)
+        N = X.shape[1]
+        L = N // SEGMENTS                 # largo por segmento
+        if L == 0:
+            continue
+        # usar exactamente SEGMENTS segmentos no solapados
+        for seg in range(SEGMENTS):
+            s = seg * L
+            e = s + L
+            if e > N: break
+            Xb = X[:, s:e].copy()         # (4, L)
+            if REMOVE_MEAN:
+                Xb -= Xb.mean(axis=1, keepdims=True)
+            R = cov_from_X(Xb)            # (4,4)
 
-        # Segmentar X
-        for seg_idx, Xseg in iter_segments(X, n_segments=N_SEGMENTS, L=L):
-            Rxx_seg = cov_from_X(Xseg)  # (4, 4)
-            out_path = OUT_DIR / f"Rxx_{angle}_{stamp}_seg{seg_idx:02d}.npy"
-            np.save(out_path, Rxx_seg)
-            total_saved += 1
+            r_flat = R.reshape(-1)        # 16 complejos en orden fila
+            rows_real.append(np.real(r_flat))
+            rows_imag.append(np.imag(r_flat))
+            labels.append(angle)
+            meta.append((angle, stamp, seg))
 
-    summary.append((angle, len(items), len(selected), total_saved))
+# ===== 4) Empaquetar y guardar =====
+X_real = np.vstack(rows_real).astype(np.float32)   # (samples, 16)
+X_imag = np.vstack(rows_imag).astype(np.float32)   # (samples, 16)
+y_txt  = np.array(labels)                          # (samples,)
+y_idx  = np.array([angle_to_idx[a] for a in labels], dtype=np.int32)
 
-# ===== 4) Resumen final =====
-angles_sorted = sorted(summary, key=lambda a: (a[0][0], int(a[0][1:])))
-print("\n=== RESUMEN COV SEGMENTADO ===")
-for angle, total, used, saved in angles_sorted:
-    print(f"{angle}: tomas_completas={total} | usadas={used} | Rxx guardadas={saved} (segmentos)")
-print(f"\nRxx segmentadas guardadas en: {OUT_DIR}")
+DATA_DIR = OUT_DIR / "ML_data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Formato NPZ (recomendado para ML en Python)
+np.savez_compressed(
+    DATA_DIR / "dataset_cov_4x4_segments50.npz",
+    X_real=X_real, X_imag=X_imag,
+    y_txt=y_txt, y_idx=y_idx,
+    angle_to_idx=angle_to_idx,
+    meta=np.array(meta, dtype=object)
+)
+
+# Opcional: CSV con columnas reales e imaginarias separadas
+# Columnas: R00_re, R01_re, ..., R33_re, R00_im, ..., R33_im, label
+col_re = [f"R{i}{j}_re" for i in range(4) for j in range(4)]
+col_im = [f"R{i}{j}_im" for i in range(4) for j in range(4)]
+header = ",".join(col_re + col_im + ["label"])
+csv_path = DATA_DIR / "dataset_cov_4x4_segments50.csv"
+with open(csv_path, "w", encoding="utf-8") as f:
+    f.write(header + "\n")
+    for k in range(X_real.shape[0]):
+        row = list(X_real[k].tolist()) + list(X_imag[k].tolist()) + [y_txt[k]]
+        f.write(",".join(map(str, row)) + "\n")
+
+# ===== 5) Resumen =====
+samples_per_angle = {}
+for a in labels:
+    samples_per_angle[a] = samples_per_angle.get(a, 0) + 1
+
+print("\n=== RESUMEN DATASET ===")
+for a in angles_sorted:
+    print(f"{a}: {samples_per_angle.get(a, 0)} muestras")
+print(f"\nTotal muestras: {len(labels)}")
+print(f"NPZ: {DATA_DIR/'dataset_cov_4x4_segments50.npz'}")
+print(f"CSV: {csv_path}")
